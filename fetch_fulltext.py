@@ -1084,15 +1084,31 @@ def run(input_path: Path, out_dir: Path, email: str, *,
                 work(row)
                 time.sleep(delay)
         else:
-            with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                futures = [ex.submit(work, row) for row in batch]
+            # NB: don't use `with ThreadPoolExecutor` — its __exit__ waits for
+            # EVERY queued task, so Ctrl+C wouldn't cancel until the whole batch
+            # finished. Instead, on interrupt we cancel the not-yet-started tasks
+            # and let only the in-flight ones drain (bounded by --paper-timeout).
+            ex = ThreadPoolExecutor(max_workers=n_workers)
+            futures = [ex.submit(work, row) for row in batch]
+            try:
                 for fut in as_completed(futures):
                     try:
                         fut.result()
                     except Exception as e:      # a worker shouldn't crash, but
                         with lock:              # never let one kill the pool
                             print(f"        !! worker error: {type(e).__name__}: {e}")
+            except KeyboardInterrupt:
+                with lock:
+                    print("\n^C — cancelling queued papers; letting in-flight "
+                          "finish (a few, bounded by --paper-timeout). "
+                          "Re-run the same command to resume.")
+                for f in futures:
+                    f.cancel()              # cancels only not-yet-started tasks
+                ex.shutdown(wait=False)
+                raise
+            ex.shutdown(wait=False)
 
+    interrupted = False
     try:
         fetch_batch(pending)
         # Auto-retry misses within the same run: many are transient (rate-limit,
@@ -1113,6 +1129,8 @@ def run(input_path: Path, out_dir: Path, email: str, *,
             print(f"-- round {rnd}: recovered {recovered} --")
             if recovered <= 0:
                 break
+    except KeyboardInterrupt:
+        interrupted = True       # progress is already on disk; save + report below
     finally:
         if browser is not None:
             browser.close()
@@ -1127,6 +1145,9 @@ def run(input_path: Path, out_dir: Path, email: str, *,
                         and r.pub_id in prior_miss)
         print(f"\nRecheck: recovered {recovered}/{len(prior_miss)} "
               f"previously-missed papers this pass.")
+    if interrupted:
+        print("\n** Interrupted — progress saved. Re-run the same command to "
+              "resume where it stopped. **")
     print(f"\nManifest: {manifest_csv}")
 
 
