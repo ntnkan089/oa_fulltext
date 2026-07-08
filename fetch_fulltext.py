@@ -63,7 +63,9 @@ import csv
 import json
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # UTF-8 stdout on Windows so titles with accents/em-dashes don't crash prints.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -162,6 +164,11 @@ def make_session(email: str) -> requests.Session:
                    "*/*;q=0.8"),
         "Accept-Language": "en-US,en;q=0.9",
     })
+    # Wider connection pool so concurrent workers don't block on / warn about a
+    # full pool (the default maxsize is 10).
+    adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
@@ -672,6 +679,24 @@ def _clean_text(text: str | None) -> str:
     return text.strip()
 
 
+# A "successful" fetch that is really a bot-challenge / block page (Anubis
+# proof-of-work, Cloudflare "Just a moment", a plain Access Denied) clears the
+# --min-chars bar with ~1k chars of boilerplate and gets saved as if it were
+# the paper. Reject it so it counts as a miss, not a thin hit. We only inspect
+# the head — these pages announce themselves in the first line or two, and this
+# keeps a real paper that merely mentions e.g. "cloudflare" from being nuked.
+BOTWALL_RE = re.compile(
+    r"making sure you'?re not a bot|proof-of-work scheme|"
+    r"just a moment\.\.\.|checking your browser before|"
+    r"enable javascript and cookies to continue|"
+    r"verify you are (?:a )?human|access to this page has been denied",
+    re.I)
+
+
+def _is_botwall(text: str) -> bool:
+    return bool(text) and bool(BOTWALL_RE.search(text[:1500]))
+
+
 # ---------- orchestration ----------
 
 def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
@@ -696,8 +721,9 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
     candidates: list[tuple[str, str, str]] = []   # (text, source, url)
 
     def consider(got, label: str) -> bool:
-        """Record a (text, url) result; return True if confident enough to stop."""
-        if got and got[0] and len(got[0]) >= min_chars:
+        """Record a (text, url) result; return True if confident enough to stop.
+        Bot-challenge pages are dropped here so they never count as text."""
+        if got and got[0] and len(got[0]) >= min_chars and not _is_botwall(got[0]):
             candidates.append((got[0], label, got[1]))
             return len(got[0]) >= CONFIDENT_CHARS
         return False
@@ -902,7 +928,7 @@ def write_manifest_csv(records: list[Result], path: Path) -> None:
 
 def run(input_path: Path, out_dir: Path, email: str, *,
         ids: list[str] | None, sample: int | None, limit: int | None,
-        min_chars: int, delay: float, resume: bool,
+        min_chars: int, delay: float, resume: bool, workers: int = 8,
         elsevier_key: str | None = None, springer_key: str | None = None,
         wiley_token: str | None = None, use_browser: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -915,6 +941,14 @@ def run(input_path: Path, out_dir: Path, email: str, *,
     if not resume:
         manifest_jsonl.unlink(missing_ok=True)
 
+    session = make_session(email)
+    browser = BrowserRenderer() if use_browser else None
+    # Playwright's sync API is single-thread-only, so the browser fallback forces
+    # serial mode. Otherwise fetch `workers` papers at once — the per-paper design
+    # (each writes its own .txt + one manifest line) makes this safe with just a
+    # lock around the shared manifest append and the progress counter.
+    n_workers = 1 if use_browser else max(1, workers)
+
     print(f"Input: {input_path.name}  ({len(rows)} rows)")
     print(f"Selected {len(todo)} publications to fetch "
           f"({'resume, ' + str(len(done)) + ' already done' if resume else 'fresh run'})")
@@ -922,28 +956,52 @@ def run(input_path: Path, out_dir: Path, email: str, *,
     print(f"Keys: Elsevier {'on' if elsevier_key else 'off'}, "
           f"Springer {'on' if springer_key else 'off'}, "
           f"Wiley {'on' if wiley_token else 'off'}  |  "
-          f"browser fallback: {'on' if use_browser else 'off'}\n")
+          f"browser fallback: {'on' if use_browser else 'off'}  |  "
+          f"workers: {n_workers}\n")
 
-    session = make_session(email)
-    browser = BrowserRenderer() if use_browser else None
+    # Announce skips and build the work list before fanning out.
+    pending: list[dict] = []
+    for row in todo:
+        pub_id = str(row[COL_ID]).strip()
+        if resume and pub_id in done:
+            print(f"  {pub_id}  ({row.get(COL_PUBLISHER, '')})  already done, skipping")
+        else:
+            pending.append(row)
+    total = len(pending)
+
     records: list[Result] = []
-    try:
-        for i, row in enumerate(todo, 1):
-            pub_id = str(row[COL_ID]).strip()
-            pub = str(row.get(COL_PUBLISHER, ""))
-            if resume and pub_id in done:
-                print(f"[{i}/{len(todo)}] {pub_id}  ({pub})  already done, skipping")
-                continue
-            print(f"[{i}/{len(todo)}] {pub_id}  ({pub})  {row[COL_DOI]}")
-            res = process_one(session, row, out_dir, email, min_chars,
-                              elsevier_key, springer_key, wiley_token, browser)
-            records.append(res)
+    lock = threading.Lock()
+    counter = {"n": 0}
+
+    def work(row: dict) -> Result:
+        res = process_one(session, row, out_dir, email, min_chars,
+                          elsevier_key, springer_key, wiley_token, browser)
+        with lock:                       # serialize manifest append + progress
+            counter["n"] += 1
+            k = counter["n"]
             with manifest_jsonl.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(res), ensure_ascii=False) + "\n")
+            records.append(res)
             flag = "OK " if res.status == "ok" else "-- "
+            print(f"[{k}/{total}] {res.pub_id}  ({res.publisher})  {res.doi}")
             print(f"        {flag}{res.status:16} {res.source:14} "
                   f"{res.chars:>7} chars  {res.note}")
-            time.sleep(delay)
+        return res
+
+    try:
+        if n_workers == 1:
+            for row in pending:
+                work(row)
+                time.sleep(delay)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futures = [ex.submit(work, row) for row in pending]
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:      # a worker shouldn't crash, but
+                        with lock:              # never let one kill the pool
+                            print(f"        !! worker error: {type(e).__name__}: {e}")
     finally:
         if browser is not None:
             browser.close()
@@ -1050,7 +1108,11 @@ def main():
                     help="Min chars to count an extraction as success "
                          f"(default {DEFAULT_MIN_CHARS})")
     ap.add_argument("--delay", type=float, default=0.5,
-                    help="Seconds to sleep between papers (be polite)")
+                    help="Seconds to sleep between papers in serial mode "
+                         "(--workers 1 / --use-browser). Ignored when workers>1.")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="Papers to fetch concurrently (default 8). Forced to 1 "
+                         "with --use-browser (Playwright is single-threaded).")
     ap.add_argument("--restart", action="store_true",
                     help="Ignore any existing manifest and start fresh "
                          "(default is to resume / skip done ids)")
@@ -1091,6 +1153,7 @@ def main():
     run(Path(args.input), Path(args.out), args.email,
         ids=args.ids, sample=args.sample, limit=args.limit,
         min_chars=args.min_chars, delay=args.delay, resume=not args.restart,
+        workers=args.workers,
         elsevier_key=elsevier_key, springer_key=springer_key,
         wiley_token=wiley_token, use_browser=args.use_browser)
 

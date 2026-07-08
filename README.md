@@ -74,8 +74,8 @@ python fetch_fulltext.py --sample 2
 # specific publication ids
 python fetch_fulltext.py --ids pub.1192432907 pub.1191002603
 
-# a real batch from the sheet (first N rows)
-python fetch_fulltext.py --limit 100
+# a real batch from the sheet (first N rows), 12 papers at a time
+python fetch_fulltext.py --limit 100 --workers 12
 
 # custom DOI list (any CSV with 'Publication ID' + 'DOI' columns)
 python fetch_fulltext.py --input my_dois.csv
@@ -92,6 +92,22 @@ python fetch_fulltext.py --sample 30 --use-browser
 Keys: Elsevier (free, https://dev.elsevier.com), Springer Nature (free,
 https://dev.springernature.com). Both are optional — the pipeline runs key-free
 and only uses a key for that publisher's DOIs.
+
+**Concurrency.** `--workers N` (default 8) fetches N papers at once — the main
+lever for a full-scale run (270 papers ≈ 25 min serial → a few minutes at
+`--workers 12`; the 20k corpus goes from ~30 h to a few hours). Each paper writes
+its own file + manifest line, so parallel workers never collide, and resume works
+unchanged. `--use-browser` forces `--workers 1` (Playwright is single-threaded).
+
+**Bot-wall guard.** Some repositories/publishers (EconStor's Anubis, Cloudflare
+"Just a moment") serve a ~1 KB "prove you're human" page that would otherwise
+clear `--min-chars` and be saved as if it were the paper. Those are detected and
+recorded as `oa_blocked`, not counted as hits.
+
+**Quality audit.** `python audit_quality.py [out_dir ...]` scans retrieved `.txt`
+files and flags ones that look like hits but aren't real full text — bot-wall
+pages, abstract/references-only landing scrapes, and short stubs — so the hit
+rate isn't inflated by non-papers.
 
 Re-running **resumes** automatically (skips Publication IDs already fetched OK,
 per `out/_manifest.jsonl`); pass `--restart` to start fresh. `--input` defaults
