@@ -116,6 +116,14 @@ Re-running **resumes** automatically (skips Publication IDs already fetched OK,
 per `out/_manifest.jsonl`); pass `--restart` to start fresh. `--input` defaults
 to the `oa_selected_pub - Sheet1.csv` in Downloads.
 
+**Built for scale (20k):** resume also **caches misses** — papers already
+recorded `oa_blocked` / `not_indexed` are skipped on restart (pass
+`--retry-misses` to re-attempt), so a big run doesn't re-hit thousands of dead
+DOIs, each costing several 45 s timeouts. `--paper-timeout N` (default 120 s) is a
+soft per-paper budget that stops trying more sources once exceeded, so one hung
+server can't stall a worker. The `get()` helper honors `429`/`503` `Retry-After`
+so a fast run backs off instead of getting the polite-pool APIs to block it.
+
 ## Output
 
 | file | what |

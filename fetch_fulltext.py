@@ -174,7 +174,9 @@ def make_session(email: str) -> requests.Session:
 
 
 def get(session, url, *, params=None, timeout=40, stream=False):
-    """GET with one retry on transient failure; returns Response or None."""
+    """GET with one retry on transient failure; returns Response or None.
+    Honors 429/503 rate-limit signals (Retry-After) — important at 20k scale
+    where Unpaywall/Europe PMC will throttle a fast run."""
     for attempt in (1, 2):
         try:
             r = session.get(url, params=params, timeout=timeout,
@@ -184,6 +186,15 @@ def get(session, url, *, params=None, timeout=40, stream=False):
             # 404 from Unpaywall/EuropePMC just means "not there" — don't retry.
             if r.status_code in (400, 404):
                 return r
+            # Rate-limited / temporarily unavailable: wait the server-requested
+            # time (capped) and retry once.
+            if r.status_code in (429, 503) and attempt == 1:
+                try:
+                    wait = float(r.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    wait = 5.0
+                time.sleep(min(max(wait, 1.0), 30.0))
+                continue
         except requests.RequestException:
             pass
         if attempt == 1:
@@ -742,7 +753,8 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
                      springer_key: str | None = None,
                      wiley_token: str | None = None,
                      publisher: str = "", title: str = "",
-                     browser: "BrowserRenderer | None" = None
+                     browser: "BrowserRenderer | None" = None,
+                     deadline: float | None = None
                      ) -> tuple[str, str, str, str]:
     """Resolve a DOI to full text across every source, best-quality-first, and
     keep the LONGEST result ("best of locations") so a repository abstract never
@@ -769,6 +781,11 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
     def best():
         text, label, url = max(candidates, key=lambda c: len(c[0]))
         return (text, label, url, "")
+
+    def over_budget() -> bool:
+        """True once we've spent the per-paper time budget. Checked before the
+        slow fan-out steps so one hung DOI can't tie up a worker for minutes."""
+        return deadline is not None and time.monotonic() > deadline
 
     # 0a. Elsevier full-text API (key + Elsevier DOI). Cleanest path past
     #     ScienceDirect's JS wall.
@@ -817,6 +834,8 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
 
     # 4. Unpaywall PDFs (every location).
     for loc in locs:
+        if over_budget():
+            break
         pdf_url = loc.get("url_for_pdf")
         if pdf_url and consider((fetch_pdf_text(session, pdf_url), pdf_url),
                                 "unpaywall_pdf"):
@@ -824,6 +843,8 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
 
     # 5. Unpaywall landing pages (HTML body or a PDF the page links).
     for loc in locs:
+        if over_budget():
+            break
         page_url = loc.get("url_for_landing_page") or loc.get("url")
         if page_url and consider((fetch_html_text(session, page_url), page_url),
                                  "landing_html"):
@@ -833,7 +854,7 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
     #    (recovers MDPI/Frontiers whose repository deposit was abstract-only but
     #    that also sit in PMC). Strict title/DOI match guards against mismatches.
     confident = any(len(t) >= CONFIDENT_CHARS for t, _, _ in candidates)
-    if not confident and not pmcid and title:
+    if not confident and not pmcid and title and not over_budget():
         tp = europepmc_pmcid_by_title(session, title, doi)
         if tp:
             saw_location = True
@@ -858,7 +879,8 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
 def process_one(session, row: dict, out_dir: Path, email: str, min_chars: int,
                 elsevier_key: str | None = None, springer_key: str | None = None,
                 wiley_token: str | None = None,
-                browser: "BrowserRenderer | None" = None) -> Result:
+                browser: "BrowserRenderer | None" = None,
+                paper_timeout: float = 120.0) -> Result:
     pub_id = str(row[COL_ID]).strip()
     doi = str(row[COL_DOI]).strip()
     publisher = str(row.get(COL_PUBLISHER, "") or "")
@@ -867,12 +889,14 @@ def process_one(session, row: dict, out_dir: Path, email: str, min_chars: int,
     if not doi or doi.lower() == "nan":
         res.status, res.note = "error", "missing DOI"
         return res
+    deadline = time.monotonic() + paper_timeout if paper_timeout else None
     try:
         text, source, url, reason = resolve_fulltext(
             session, doi, email, min_chars,
             elsevier_key=elsevier_key, springer_key=springer_key,
             wiley_token=wiley_token, publisher=publisher,
-            title=str(row.get(COL_TITLE, "") or ""), browser=browser)
+            title=str(row.get(COL_TITLE, "") or ""), browser=browser,
+            deadline=deadline)
     except Exception as e:                       # never let one DOI kill the run
         res.status, res.note = "error", f"{type(e).__name__}: {e}"
         return res
@@ -936,11 +960,16 @@ def select_rows(rows: list[dict], *, ids: list[str] | None,
 
 # ---------- manifest / resume ----------
 
-def load_done(manifest_jsonl: Path) -> set[str]:
-    """pub_ids already fetched OK (so --resume can skip them)."""
-    done: set[str] = set()
+def load_done(manifest_jsonl: Path) -> tuple[set[str], set[str]]:
+    """Return (done_ok, done_miss): pub_ids already fetched OK, and pub_ids
+    already recorded as a miss (oa_blocked / not_indexed). Resume always skips
+    done_ok; done_miss is skipped too unless --retry-misses, so a big run
+    doesn't re-hit thousands of dead DOIs (each several 45s timeouts) on every
+    restart. `error` rows are NOT cached — those may be transient, so retry."""
+    done_ok: set[str] = set()
+    done_miss: set[str] = set()
     if not manifest_jsonl.exists():
-        return done
+        return done_ok, done_miss
     with manifest_jsonl.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -950,9 +979,12 @@ def load_done(manifest_jsonl: Path) -> set[str]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if str(rec.get("status", "")).startswith("ok"):
-                done.add(rec["pub_id"])
-    return done
+            status = str(rec.get("status", ""))
+            if status.startswith("ok"):
+                done_ok.add(rec["pub_id"])
+            elif status in ("oa_blocked", "not_indexed"):
+                done_miss.add(rec["pub_id"])
+    return done_ok, done_miss
 
 
 def write_manifest_csv(records: list[Result], path: Path) -> None:
@@ -968,6 +1000,7 @@ def write_manifest_csv(records: list[Result], path: Path) -> None:
 def run(input_path: Path, out_dir: Path, email: str, *,
         ids: list[str] | None, sample: int | None, limit: int | None,
         min_chars: int, delay: float, resume: bool, workers: int = 8,
+        retry_misses: bool = False, paper_timeout: float = 120.0,
         elsevier_key: str | None = None, springer_key: str | None = None,
         wiley_token: str | None = None, use_browser: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -976,7 +1009,7 @@ def run(input_path: Path, out_dir: Path, email: str, *,
 
     rows = load_rows(input_path)
     todo = select_rows(rows, ids=ids, sample=sample, limit=limit)
-    done = load_done(manifest_jsonl) if resume else set()
+    done_ok, done_miss = load_done(manifest_jsonl) if resume else (set(), set())
     if not resume:
         manifest_jsonl.unlink(missing_ok=True)
 
@@ -990,22 +1023,30 @@ def run(input_path: Path, out_dir: Path, email: str, *,
 
     print(f"Input: {input_path.name}  ({len(rows)} rows)")
     print(f"Selected {len(todo)} publications to fetch "
-          f"({'resume, ' + str(len(done)) + ' already done' if resume else 'fresh run'})")
+          f"({'resume, ' + str(len(done_ok)) + ' done + ' + str(len(done_miss)) + ' cached misses' if resume else 'fresh run'})")
     print(f"Output dir: {out_dir}")
     print(f"Keys: Elsevier {'on' if elsevier_key else 'off'}, "
           f"Springer {'on' if springer_key else 'off'}, "
           f"Wiley {'on' if wiley_token else 'off'}  |  "
           f"browser fallback: {'on' if use_browser else 'off'}  |  "
-          f"workers: {n_workers}\n")
+          f"workers: {n_workers}  |  paper timeout: {paper_timeout:g}s\n")
 
-    # Announce skips and build the work list before fanning out.
+    # Build the work list. Resume skips already-fetched OK ids, and (unless
+    # --retry-misses) already-recorded misses too, so a restart doesn't re-hit
+    # thousands of dead DOIs.
     pending: list[dict] = []
+    n_skip_ok = n_skip_miss = 0
     for row in todo:
         pub_id = str(row[COL_ID]).strip()
-        if resume and pub_id in done:
-            print(f"  {pub_id}  ({row.get(COL_PUBLISHER, '')})  already done, skipping")
+        if resume and pub_id in done_ok:
+            n_skip_ok += 1
+        elif resume and pub_id in done_miss and not retry_misses:
+            n_skip_miss += 1
         else:
             pending.append(row)
+    if resume and (n_skip_ok or n_skip_miss):
+        print(f"  skipping {n_skip_ok} already-done + {n_skip_miss} cached misses"
+              f"{' (--retry-misses to re-attempt misses)' if n_skip_miss else ''}")
     total = len(pending)
 
     records: list[Result] = []
@@ -1014,7 +1055,8 @@ def run(input_path: Path, out_dir: Path, email: str, *,
 
     def work(row: dict) -> Result:
         res = process_one(session, row, out_dir, email, min_chars,
-                          elsevier_key, springer_key, wiley_token, browser)
+                          elsevier_key, springer_key, wiley_token, browser,
+                          paper_timeout)
         with lock:                       # serialize manifest append + progress
             counter["n"] += 1
             k = counter["n"]
@@ -1165,6 +1207,14 @@ def main():
     ap.add_argument("--restart", action="store_true",
                     help="Ignore any existing manifest and start fresh "
                          "(default is to resume / skip done ids)")
+    ap.add_argument("--retry-misses", action="store_true",
+                    help="On resume, also re-attempt papers previously recorded "
+                         "as oa_blocked / not_indexed (default: skip them, so a "
+                         "big run doesn't re-hit dead DOIs every restart).")
+    ap.add_argument("--paper-timeout", type=float, default=120.0,
+                    help="Soft per-paper time budget in seconds (default 120). "
+                         "Stops trying more sources once exceeded so one hung "
+                         "DOI can't stall a worker. 0 disables.")
     ap.add_argument("--elsevier-key", default=None,
                     help="Elsevier Article Retrieval API key (or set "
                          "$ELSEVIER_API_KEY). Clean full-text for "
@@ -1202,7 +1252,8 @@ def main():
     run(Path(args.input), Path(args.out), args.email,
         ids=args.ids, sample=args.sample, limit=args.limit,
         min_chars=args.min_chars, delay=args.delay, resume=not args.restart,
-        workers=args.workers,
+        workers=args.workers, retry_misses=args.retry_misses,
+        paper_timeout=args.paper_timeout,
         elsevier_key=elsevier_key, springer_key=springer_key,
         wiley_token=wiley_token, use_browser=args.use_browser)
 
