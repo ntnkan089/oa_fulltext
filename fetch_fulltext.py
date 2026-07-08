@@ -999,7 +999,7 @@ def run(input_path: Path, out_dir: Path, email: str, *,
         ids: list[str] | None, sample: int | None, limit: int | None,
         min_chars: int, delay: float, resume: bool, workers: int = 8,
         retry_misses: bool = False, recheck_misses: bool = False,
-        paper_timeout: float = 120.0,
+        miss_retries: int = 0, paper_timeout: float = 120.0,
         elsevier_key: str | None = None, springer_key: str | None = None,
         wiley_token: str | None = None, use_browser: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1054,42 +1054,65 @@ def run(input_path: Path, out_dir: Path, email: str, *,
     if resume and (n_skip_ok or n_skip_miss):
         print(f"  skipping {n_skip_ok} already-done + {n_skip_miss} cached misses"
               f"{' (--retry-misses to re-attempt misses)' if n_skip_miss else ''}")
-    total = len(pending)
-
     records: list[Result] = []
     lock = threading.Lock()
-    counter = {"n": 0}
 
-    def work(row: dict) -> Result:
-        res = process_one(session, row, out_dir, email, min_chars,
-                          elsevier_key, springer_key, wiley_token, browser,
-                          paper_timeout)
-        with lock:                       # serialize manifest append + progress
-            counter["n"] += 1
-            k = counter["n"]
-            with manifest_jsonl.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(asdict(res), ensure_ascii=False) + "\n")
-            records.append(res)
-            flag = "OK " if res.status == "ok" else "-- "
-            print(f"[{k}/{total}] {res.pub_id}  ({res.publisher})  {res.doi}")
-            print(f"        {flag}{res.status:16} {res.source:14} "
-                  f"{res.chars:>7} chars  {res.note}")
-        return res
+    def fetch_batch(batch: list[dict], label: str = "") -> None:
+        """Fetch a list of rows concurrently, appending each result to the
+        manifest under the lock. Reused for the main pass and each retry round."""
+        total = len(batch)
+        counter = {"n": 0}
 
-    try:
+        def work(row: dict) -> Result:
+            res = process_one(session, row, out_dir, email, min_chars,
+                              elsevier_key, springer_key, wiley_token, browser,
+                              paper_timeout)
+            with lock:                   # serialize manifest append + progress
+                counter["n"] += 1
+                k = counter["n"]
+                with manifest_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(asdict(res), ensure_ascii=False) + "\n")
+                records.append(res)
+                flag = "OK " if res.status == "ok" else "-- "
+                print(f"[{label}{k}/{total}] {res.pub_id}  ({res.publisher})  {res.doi}")
+                print(f"        {flag}{res.status:16} {res.source:14} "
+                      f"{res.chars:>7} chars  {res.note}")
+            return res
+
         if n_workers == 1:
-            for row in pending:
+            for row in batch:
                 work(row)
                 time.sleep(delay)
         else:
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
-                futures = [ex.submit(work, row) for row in pending]
+                futures = [ex.submit(work, row) for row in batch]
                 for fut in as_completed(futures):
                     try:
                         fut.result()
                     except Exception as e:      # a worker shouldn't crash, but
                         with lock:              # never let one kill the pool
                             print(f"        !! worker error: {type(e).__name__}: {e}")
+
+    try:
+        fetch_batch(pending)
+        # Auto-retry misses within the same run: many are transient (rate-limit,
+        # timeout, network), and a retry over the smaller miss set — less load —
+        # clears them. Stop as soon as a round recovers nothing (converged), or
+        # after --miss-retries rounds.
+        for rnd in range(1, miss_retries + 1):
+            _, miss_now = load_done(manifest_jsonl)
+            retry_rows = [r for r in rows if str(r[COL_ID]).strip() in miss_now]
+            if not retry_rows:
+                break
+            before = len(miss_now)
+            print(f"\n-- retry round {rnd}/{miss_retries}: re-attempting "
+                  f"{len(retry_rows)} misses --")
+            fetch_batch(retry_rows, label=f"r{rnd}:")
+            _, miss_after = load_done(manifest_jsonl)
+            recovered = before - len(miss_after)
+            print(f"-- round {rnd}: recovered {recovered} --")
+            if recovered <= 0:
+                break
     finally:
         if browser is not None:
             browser.close()
@@ -1236,6 +1259,11 @@ def main():
                          "(ignores --sample/--limit). Run this weeks later to "
                          "catch papers PMC has since indexed; reports how many "
                          "were recovered.")
+    ap.add_argument("--miss-retries", type=int, default=0,
+                    help="After the main pass, auto-retry the misses up to N "
+                         "rounds within the same run (stops early once a round "
+                         "recovers nothing). Clears transient rate-limit/timeout "
+                         "failures — folds the manual recheck loop into one run.")
     ap.add_argument("--paper-timeout", type=float, default=120.0,
                     help="Soft per-paper time budget in seconds (default 120). "
                          "Stops trying more sources once exceeded so one hung "
@@ -1278,7 +1306,8 @@ def main():
         ids=args.ids, sample=args.sample, limit=args.limit,
         min_chars=args.min_chars, delay=args.delay, resume=not args.restart,
         workers=args.workers, retry_misses=args.retry_misses,
-        recheck_misses=args.recheck_misses, paper_timeout=args.paper_timeout,
+        recheck_misses=args.recheck_misses, miss_retries=args.miss_retries,
+        paper_timeout=args.paper_timeout,
         elsevier_key=elsevier_key, springer_key=springer_key,
         wiley_token=wiley_token, use_browser=args.use_browser)
 

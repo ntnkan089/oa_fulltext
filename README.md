@@ -121,6 +121,13 @@ recorded `oa_blocked` / `not_indexed` are skipped on restart (pass
 `--retry-misses` to re-attempt), so a big run doesn't re-hit thousands of dead
 DOIs, each costing several 45 s timeouts.
 
+**Clearing transient misses in one run:** `--miss-retries N` auto-retries the
+misses up to N rounds after the main pass (stops early once a round recovers
+nothing). Many first-pass misses are transient — a worker hit a rate-limit or
+timed out under load — and a retry over the smaller miss set clears them, so you
+don't have to run `--recheck-misses` by hand afterward. (Distinct from the
+below, which is about papers that genuinely aren't available yet.)
+
 **Recovering the tail over time:** many misses are just *"not in PMC yet"* —
 MDPI/SAGE/Frontiers deposit to PMC on a lag. Run `--recheck-misses` weeks later
 to re-attempt only the recorded misses (ignores `--sample`/`--limit`) and report
