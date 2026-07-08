@@ -48,10 +48,22 @@ tried and the longest result ≥ `--min-chars` (default 1000) wins.
 
 ## Install
 
-```
+Needs Python 3.10+.
+
+```bash
+git clone https://github.com/ntnkan089/oa_fulltext.git
+cd oa_fulltext
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# macOS / Linux:
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+Optional publisher keys go in a `.env` file (copy `.env.example` to `.env` and
+paste your keys) so you don't pass them on every run — they're loaded
+automatically. `.env` is git-ignored, so your keys never get committed.
 
 ## Run
 
@@ -142,3 +154,12 @@ See `NOTES.md` for details and next steps.
 Drop one more attempt into `resolve_fulltext()` following the existing
 `(text, source_label, url, reason)` contract — nothing else changes. Good first
 candidate: Elsevier ScienceDirect (biggest slice, cleanest keyed output).
+
+## Files
+
+| file | what it does |
+| --- | --- |
+| `fetch_fulltext.py` | the whole tool: DOI resolver chain + downloader + manifest |
+| `requirements.txt` | Python dependencies |
+| `.env.example` | template for optional publisher API keys (copy to `.env`) |
+| `NOTES.md` | design notes, practicability findings, and next steps |
