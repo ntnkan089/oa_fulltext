@@ -104,10 +104,13 @@ unchanged. `--use-browser` forces `--workers 1` (Playwright is single-threaded).
 clear `--min-chars` and be saved as if it were the paper. Those are detected and
 recorded as `oa_blocked`, not counted as hits.
 
-**Quality audit.** `python audit_quality.py [out_dir ...]` scans retrieved `.txt`
-files and flags ones that look like hits but aren't real full text — bot-wall
-pages, abstract/references-only landing scrapes, and short stubs — so the hit
-rate isn't inflated by non-papers.
+**Quality grading (built in).** Every hit is auto-graded into a `quality` column
+in the manifest — `clean` (genuine full text), `non_article` (correction / erratum
+/ editorial — no body exists), `refs_only` (landing scrape that got abstract +
+bibliography but not the body), or `stub` (short abstract-only). The run summary
+prints both the raw retrieved count and the honest "genuine full text" count, so
+the hit rate isn't inflated by non-papers. `python audit_quality.py [out_dir ...]`
+is the same logic as a standalone re-check over existing folders.
 
 Re-running **resumes** automatically (skips Publication IDs already fetched OK,
 per `out/_manifest.jsonl`); pass `--restart` to start fresh. `--input` defaults
@@ -118,7 +121,7 @@ to the `oa_selected_pub - Sheet1.csv` in Downloads.
 | file | what |
 |------|------|
 | `out/pub.<ID>.txt` | one plain-text file per retrieved paper |
-| `out/_manifest.csv` | one row per attempted DOI: status, which source was used, char count, source URL |
+| `out/_manifest.csv` | one row per attempted DOI: status, source used, char count, `quality` grade, source URL |
 | `out/_manifest.jsonl` | append-only checkpoint (drives resume) |
 
 `status` is one of: `ok`, `ok_thin` (got text but it's short scraped HTML —

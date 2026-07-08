@@ -146,6 +146,7 @@ class Result:
     source: str = ""        # europepmc_xml | unpaywall_pdf | landing_html | ""
     url: str = ""           # where the text actually came from
     chars: int = 0          # length of extracted text
+    quality: str = ""       # for hits: clean | stub | refs_only | non_article
     note: str = ""          # error detail when status != ok
 
 
@@ -697,6 +698,43 @@ def _is_botwall(text: str) -> bool:
     return bool(text) and bool(BOTWALL_RE.search(text[:1500]))
 
 
+# Auto-grade a retrieved paper so the manifest is self-certifying and the hit
+# rate isn't inflated by non-papers. This is the audit_quality.py logic folded
+# into the pipeline — every hit gets one of these labels:
+#   clean        genuine full-text body
+#   non_article  correction / erratum / editorial / meeting abstract — no body
+#   refs_only    landing scrape that captured abstract + bibliography, no body
+#   stub         short abstract / repository stub, body never captured
+_NONARTICLE_RE = re.compile(
+    r"^\s*(correction|corrigendum|erratum|retraction(?: notice)?|"
+    r"editorial|withdrawal|author correction|publisher correction|"
+    r"expression of concern|book review)\b", re.I)
+_REFLINE_RE = re.compile(
+    r"Google Scholar|CrossRef|PubMed|\[DOI\]|\[PMC|PMC free article|"
+    r"doi\.org/10\.|Crossref Citations", re.I)
+_SECTION_RE = re.compile(
+    r"^\s*(introduction|background|method|materials|results|"
+    r"discussion|conclusion)\b", re.I | re.M)
+
+
+def classify_quality(text: str, source: str) -> str:
+    n = len(text)
+    head = text[:200].lstrip()
+    if _NONARTICLE_RE.match(head):
+        return "non_article"
+    # body = prose before the reference list starts
+    m = re.search(r"^\s*references\s*$", text, re.I | re.M)
+    body_chars = len(text[:m.start()].strip()) if m else n
+    has_body = bool(_SECTION_RE.search(text))
+    lines = [ln for ln in text.splitlines() if ln.strip()] or [""]
+    ref_frac = sum(1 for ln in lines if _REFLINE_RE.search(ln)) / len(lines)
+    if body_chars < 3500 and not has_body:
+        return "stub"
+    if ref_frac > 0.5 and not has_body:
+        return "refs_only"
+    return "clean"
+
+
 # ---------- orchestration ----------
 
 def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
@@ -847,6 +885,7 @@ def process_one(session, row: dict, out_dir: Path, email: str, min_chars: int,
     thin = source == "landing_html" and len(text) < THIN_LANDING_CHARS
     res.status = "ok_thin" if thin else "ok"
     res.source, res.url, res.chars = source, url, len(text)
+    res.quality = classify_quality(text, source)
     if thin:
         res.note = "short HTML — likely abstract/repository stub, not full text"
     return res
@@ -1041,6 +1080,16 @@ def _print_summary(records: list[Result]) -> None:
     print(f"SUMMARY: {len(got)}/{n} retrieved "
           f"({100*len(got)//n if n else 0}%)  "
           f"[{len(full)} full text + {len(thin)} thin/abstract-only]")
+    # quality breakdown of hits — the honest full-text count
+    q: dict[str, int] = {}
+    for r in got:
+        q[r.quality or "clean"] = q.get(r.quality or "clean", 0) + 1
+    clean = q.get("clean", 0)
+    extra = ", ".join(f"{c} {k}" for k, c in sorted(q.items())
+                      if k != "clean" and c)
+    print(f"  quality: {clean} clean full text"
+          + (f"  ({extra})" if extra else "")
+          + f"  ->  {100*clean//n if n else 0}% genuine full text")
     # by source
     by_source: dict[str, int] = {}
     for r in got:
