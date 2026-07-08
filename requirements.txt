@@ -1,0 +1,5 @@
+requests
+pymupdf      # PDF -> text extraction (import fitz)
+trafilatura  # HTML article -> clean text
+pandas       # read the oa_selected_pub CSV
+lxml         # parse Europe PMC / JATS full-text XML
