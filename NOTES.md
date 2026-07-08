@@ -65,6 +65,30 @@ Run time ~25 min (browser OFF). The browser fallback was tested and does NOT
 beat MDPI/SAGE (see "Browser fallback — reality check"), so the fast keyed run
 is the recommended config — there's no real speed/coverage tradeoff.
 
+### On the UCI VPN (IP-based institutional access) — measured
+
+Re-ran a 99-paper sample (11/publisher) off- vs on-VPN, keys on:
+
+| | off-VPN | on-VPN (UCIFull) |
+|---|---|---|
+| Retrieved | 70/99 (70%) | **77/99 (77%)** |
+
+The gain is entirely the **entitlement-gated** tail: **Oxford UP jumped 5/11 →
+11/11** (all six recovered as real full-text PDFs, 20k–84k chars), plus +1 each
+CUP/Frontiers. VPN fixes *"am I allowed"* (publisher sees a paying UCI IP), so it
+recovers subscription/hybrid PDFs that 403'd before — for free, no code.
+
+What VPN does NOT fix: **Cloudflare bot-walls**. The 22 remaining misses are
+dominated by T&F (9) + MDPI (4) + SAGE (3) = 16 Cloudflare-hardened pages that
+block the *script* regardless of entitlement — plus ~2 Wiley (token-fixable),
+~2 Elsevier (non-article/closed), ~2 Frontiers (no PMC copy yet). Verified: of
+the 77 hits, 74 are genuine full text + 1 correction + 2 recoverable-later; 0
+bot-wall pages (the bot-wall guard now rejects those, see below).
+
+Takeaway: the ceiling is **access, not availability** — most of the tail is
+Cloudflare bot-detection, which VPN/entitlement can't touch. Levers left are the
+Wiley token and a headless browser for the softer Cloudflare pages.
+
 Projection on the full 20k: ~68-70% key-free; **~77% with the Elsevier key**
 (low-80s if Elsevier entitlements are fuller from a UCI campus IP). The
 remaining tail is Cloudflare/no-PMC publisher pages + non-article DOIs.
