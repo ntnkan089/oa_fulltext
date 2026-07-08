@@ -966,10 +966,9 @@ def load_done(manifest_jsonl: Path) -> tuple[set[str], set[str]]:
     done_ok; done_miss is skipped too unless --retry-misses, so a big run
     doesn't re-hit thousands of dead DOIs (each several 45s timeouts) on every
     restart. `error` rows are NOT cached — those may be transient, so retry."""
-    done_ok: set[str] = set()
-    done_miss: set[str] = set()
+    latest: dict[str, str] = {}          # pub_id -> most recent status
     if not manifest_jsonl.exists():
-        return done_ok, done_miss
+        return set(), set()
     with manifest_jsonl.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -979,11 +978,10 @@ def load_done(manifest_jsonl: Path) -> tuple[set[str], set[str]]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            status = str(rec.get("status", ""))
-            if status.startswith("ok"):
-                done_ok.add(rec["pub_id"])
-            elif status in ("oa_blocked", "not_indexed"):
-                done_miss.add(rec["pub_id"])
+            latest[rec["pub_id"]] = str(rec.get("status", ""))
+    done_ok = {p for p, s in latest.items() if s.startswith("ok")}
+    done_miss = {p for p, s in latest.items()
+                 if s in ("oa_blocked", "not_indexed")}
     return done_ok, done_miss
 
 
@@ -1000,7 +998,8 @@ def write_manifest_csv(records: list[Result], path: Path) -> None:
 def run(input_path: Path, out_dir: Path, email: str, *,
         ids: list[str] | None, sample: int | None, limit: int | None,
         min_chars: int, delay: float, resume: bool, workers: int = 8,
-        retry_misses: bool = False, paper_timeout: float = 120.0,
+        retry_misses: bool = False, recheck_misses: bool = False,
+        paper_timeout: float = 120.0,
         elsevier_key: str | None = None, springer_key: str | None = None,
         wiley_token: str | None = None, use_browser: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1008,10 +1007,18 @@ def run(input_path: Path, out_dir: Path, email: str, *,
     manifest_csv = out_dir / "_manifest.csv"
 
     rows = load_rows(input_path)
+    # --recheck-misses re-attempts every DOI currently recorded as a miss (PMC
+    # catches up over time, VPN now on, a key was added...), ignoring the normal
+    # --sample/--limit selection. Needs the existing manifest, so it implies resume.
+    if recheck_misses:
+        resume = retry_misses = True
     todo = select_rows(rows, ids=ids, sample=sample, limit=limit)
     done_ok, done_miss = load_done(manifest_jsonl) if resume else (set(), set())
     if not resume:
         manifest_jsonl.unlink(missing_ok=True)
+    prior_miss = set(done_miss)
+    if recheck_misses:
+        todo = [r for r in rows if str(r[COL_ID]).strip() in done_miss]
 
     session = make_session(email)
     browser = BrowserRenderer() if use_browser else None
@@ -1092,22 +1099,35 @@ def run(input_path: Path, out_dir: Path, email: str, *,
     if all_records:
         write_manifest_csv(all_records, manifest_csv)
     _print_summary(all_records or records)
+    if recheck_misses and prior_miss:
+        recovered = sum(1 for r in records if r.status.startswith("ok")
+                        and r.pub_id in prior_miss)
+        print(f"\nRecheck: recovered {recovered}/{len(prior_miss)} "
+              f"previously-missed papers this pass.")
     print(f"\nManifest: {manifest_csv}")
 
 
 def _read_all_records(manifest_jsonl: Path) -> list[Result]:
-    out: list[Result] = []
+    """Read the append-only jsonl, keeping the LAST record per pub_id. Re-fetched
+    papers (e.g. --recheck-misses that flips a miss to ok) append a new line; this
+    dedup makes the newest result win so the CSV/summary never double-count."""
+    latest: dict[str, Result] = {}
+    order: list[str] = []
     if not manifest_jsonl.exists():
-        return out
+        return []
     with manifest_jsonl.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    out.append(Result(**json.loads(line)))
-                except (json.JSONDecodeError, TypeError):
-                    pass
-    return out
+            if not line:
+                continue
+            try:
+                r = Result(**json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if r.pub_id not in latest:
+                order.append(r.pub_id)
+            latest[r.pub_id] = r
+    return [latest[p] for p in order]
 
 
 def _print_summary(records: list[Result]) -> None:
@@ -1211,6 +1231,11 @@ def main():
                     help="On resume, also re-attempt papers previously recorded "
                          "as oa_blocked / not_indexed (default: skip them, so a "
                          "big run doesn't re-hit dead DOIs every restart).")
+    ap.add_argument("--recheck-misses", action="store_true",
+                    help="Re-attempt ONLY the DOIs currently recorded as misses "
+                         "(ignores --sample/--limit). Run this weeks later to "
+                         "catch papers PMC has since indexed; reports how many "
+                         "were recovered.")
     ap.add_argument("--paper-timeout", type=float, default=120.0,
                     help="Soft per-paper time budget in seconds (default 120). "
                          "Stops trying more sources once exceeded so one hung "
@@ -1253,7 +1278,7 @@ def main():
         ids=args.ids, sample=args.sample, limit=args.limit,
         min_chars=args.min_chars, delay=args.delay, resume=not args.restart,
         workers=args.workers, retry_misses=args.retry_misses,
-        paper_timeout=args.paper_timeout,
+        recheck_misses=args.recheck_misses, paper_timeout=args.paper_timeout,
         elsevier_key=elsevier_key, springer_key=springer_key,
         wiley_token=wiley_token, use_browser=args.use_browser)
 

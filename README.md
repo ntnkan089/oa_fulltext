@@ -119,7 +119,14 @@ to the `oa_selected_pub - Sheet1.csv` in Downloads.
 **Built for scale (20k):** resume also **caches misses** — papers already
 recorded `oa_blocked` / `not_indexed` are skipped on restart (pass
 `--retry-misses` to re-attempt), so a big run doesn't re-hit thousands of dead
-DOIs, each costing several 45 s timeouts. `--paper-timeout N` (default 120 s) is a
+DOIs, each costing several 45 s timeouts.
+
+**Recovering the tail over time:** many misses are just *"not in PMC yet"* —
+MDPI/SAGE/Frontiers deposit to PMC on a lag. Run `--recheck-misses` weeks later
+to re-attempt only the recorded misses (ignores `--sample`/`--limit`) and report
+how many PMC has since indexed. It's also the way to sweep up the tail after
+turning on the VPN or adding a key. The manifest CSV is deduped newest-wins, so
+recovered papers cleanly replace their old miss row. `--paper-timeout N` (default 120 s) is a
 soft per-paper budget that stops trying more sources once exceeded, so one hung
 server can't stall a worker. The `get()` helper honors `429`/`503` `Retry-After`
 so a fast run backs off instead of getting the polite-pool APIs to block it.
