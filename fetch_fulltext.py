@@ -455,7 +455,10 @@ def _xml_itertext(xml_bytes: bytes) -> str:
         for el in root.iter("{*}" + tag):
             if el.getparent() is not None:
                 el.getparent().remove(el)
-    return _clean_text(" ".join(root.itertext()))
+    # Elsevier XML stores every figure/equation as an image object, so the
+    # flattened text is littered with hundreds of api.elsevier.com / S3 object
+    # URLs (heavy on math papers). Strip bare URLs — pure noise for text use.
+    return _clean_text(_URL_RE.sub("", " ".join(root.itertext())))
 
 
 def is_wiley(doi: str, publisher: str) -> bool:
@@ -680,6 +683,17 @@ def fetch_pdf_text_from_bytes(content: bytes) -> str | None:
 
 # ---------- text cleanup ----------
 
+_URL_RE = re.compile(r"https?://\S+")
+# Elsevier metadata tokens that lead the flattened XML (the "header" noise):
+# doi:..., the 1-s2.0-... asset id, and the PII code S0022-247X(25)00810-8.
+_ELS_META_RE = re.compile(
+    r"\bdoi:\S+|\b1-s2\.0-\S+|\bS\d{4}-?\d{3}[\dX]\(\d{2}\)\d{3,}-?\w?\b")
+# A standalone reference-list heading (its own line) — the bibliography starts
+# here. Used to cut the trailing citation block from PDF/HTML extractions.
+_REF_HEADING_RE = re.compile(
+    r"^\s*(references|bibliography|works cited|literature cited)\s*$", re.I | re.M)
+
+
 def _clean_text(text: str | None) -> str:
     if not text:
         return ""
@@ -689,6 +703,29 @@ def _clean_text(text: str | None) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def clean_for_embedding(text: str) -> str:
+    """Extra scrub for a corpus destined for embedding/RAG (applied at export,
+    not to the raw .txt). Three targeted removals, all pure-noise for retrieval:
+      1. trailing reference list — a big block of OTHER papers' citations
+      2. bare URLs — Elsevier figure/equation object links, etc.
+      3. leading Elsevier metadata tokens (doi:/PII/asset id)
+    Conservative: the ref cut only fires on a standalone heading in the back
+    half of the document, so an early "References" mention can't truncate a paper.
+    """
+    # 1. cut the trailing bibliography (last heading past the 50% mark)
+    cut = None
+    for m in _REF_HEADING_RE.finditer(text):
+        if m.start() > len(text) * 0.5:
+            cut = m.start()
+            break
+    if cut is not None:
+        text = text[:cut]
+    # 2 + 3. strip URLs and Elsevier metadata tokens
+    text = _URL_RE.sub("", text)
+    text = _ELS_META_RE.sub("", text)
+    return _clean_text(text)
 
 
 # A "successful" fetch that is really a bot-challenge / block page (Anubis
@@ -1011,13 +1048,17 @@ def write_manifest_csv(records: list[Result], path: Path) -> None:
 
 
 def export_clean_corpus(out_dir: Path, min_chars: int = 1500,
-                        include: set[str] | None = None) -> tuple[int, dict]:
+                        include: set[str] | None = None,
+                        clean: bool = True) -> tuple[int, dict]:
     """Write out_dir/clean_corpus.jsonl — only genuine full-text papers, ready
     for a downstream embedding/RAG pipeline. Re-grades each .txt from disk (via
     classify_quality) so garbage (non_article / stub / refs_only / bot-wall) is
-    dropped even in folders fetched before grading existed. Returns
-    (kept_count, dropped_reason_counts). Also writes clean_index.csv (kept rows,
-    no text) for review. Shared by --export and export_clean.py so they agree."""
+    dropped even in folders fetched before grading existed. With clean=True
+    (default) each kept paper is scrubbed via clean_for_embedding (drops the
+    trailing reference list, bare URLs, Elsevier metadata) — the grade is decided
+    on the RAW text first, then the scrub is applied to what gets written.
+    Returns (kept_count, dropped_reason_counts). Also writes clean_index.csv.
+    Shared by --export and export_clean.py so they agree."""
     keep = {"clean", *(include or set())}
     manifest = out_dir / "_manifest.csv"
     if not manifest.exists():
@@ -1040,9 +1081,10 @@ def export_clean_corpus(out_dir: Path, min_chars: int = 1500,
             if len(text) < min_chars:
                 dropped[f"short(<{min_chars})"] = dropped.get(f"short(<{min_chars})", 0) + 1
                 continue
+            body = clean_for_embedding(text) if clean else text
             corpus.write(json.dumps({
                 "pub_id": r["pub_id"], "doi": r["doi"], "publisher": r["publisher"],
-                "source": r["source"], "chars": len(text), "text": text,
+                "source": r["source"], "chars": len(body), "text": body,
             }, ensure_ascii=False) + "\n")
             kept.append(r)
     if kept:

@@ -142,9 +142,12 @@ so a fast run backs off instead of getting the polite-pool APIs to block it.
 the consumer corpus. When a run is finished, run
 `python export_clean.py <run_dir>` to write `clean_corpus.jsonl` — one JSON line
 per *genuine* full-text paper (`{pub_id, doi, publisher, source, chars, text}`),
-with the garbage (`non_article` / `stub` / `refs_only` / bot-wall) filtered out —
-so a downstream embedding / RAG pipeline can ingest it directly. Tune freely
-without re-fetching: `--min-chars N`, `--include stub`. (Kept separate so a
+with the garbage (`non_article` / `stub` / `refs_only` / bot-wall) filtered out.
+Each kept paper is also **scrubbed for embedding**: the trailing reference list,
+bare URLs (Elsevier XML embeds a figure/equation object URL per formula — hundreds
+per math paper), and Elsevier metadata tokens are removed, so all sources come out
+uniform like the clean PMC XML. Pass `--raw` to keep the unscrubbed text. Tune
+freely without re-fetching: `--min-chars N`, `--include stub`. (Kept separate so a
 resumed 20k run isn't forced to re-read every `.txt` on each pass; pass `--export`
 to the fetcher if you do want it inline.)
 

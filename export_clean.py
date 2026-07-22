@@ -34,13 +34,17 @@ def main():
     ap.add_argument("--include", nargs="*", default=[],
                     choices=["stub", "refs_only", "non_article"],
                     help="Also keep these grades (default: clean only)")
+    ap.add_argument("--raw", action="store_true",
+                    help="Skip the embedding scrub (keep reference lists, URLs, "
+                         "and Elsevier metadata in the exported text).")
     args = ap.parse_args()
 
     base = Path(__file__).resolve().parent / args.run_dir
     if not (base / "_manifest.csv").exists():
         sys.exit(f"no manifest at {base / '_manifest.csv'}")
 
-    kept, dropped = export_clean_corpus(base, args.min_chars, set(args.include))
+    kept, dropped = export_clean_corpus(base, args.min_chars, set(args.include),
+                                        clean=not args.raw)
     keep = ", ".join(sorted({"clean", *args.include}))
     print(f"{args.run_dir}/: KEPT {kept} clean papers -> clean_corpus.jsonl "
           f"({keep}, >= {args.min_chars} chars)")
