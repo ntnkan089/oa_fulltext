@@ -425,22 +425,67 @@ def is_elsevier(doi: str, publisher: str) -> bool:
 
 def fetch_elsevier(session, doi: str, key: str) -> tuple[str, str] | None:
     """Fetch an Elsevier article's full text by DOI via the Article Retrieval
-    API. Asks for text/plain (no parsing); falls back to flattening XML if the
-    API hands back XML anyway. Returns (text, url) or None (e.g. not entitled)."""
+    API. Requests XML and extracts ONLY the article subtree (title + abstract +
+    body sections), because Elsevier's text/plain / full-XML flatten dumps ~25 KB
+    of metadata schema, a per-figure asset list, and reference stubs BEFORE the
+    paper. Math is kept (flattened inline). Returns (text, url) or None."""
     url = ELSEVIER_ARTICLE.format(doi=doi)
     try:
         r = session.get(url, headers={"X-ELS-APIKey": key,
-                                      "Accept": "text/plain"}, timeout=60)
+                                      "Accept": "application/xml"}, timeout=60)
     except requests.RequestException:
         return None
     if r.status_code != 200 or not r.content:
         return None
-    body = r.content.lstrip()
-    if body[:1] == b"<":                 # got XML — flatten it
-        text = _xml_itertext(r.content)
-    else:
-        text = _clean_text(r.text)
+    text = ""
+    if r.content.lstrip()[:1] == b"<":
+        text = _elsevier_xml_to_text(r.content)
+    if not text:                          # parse failed / unexpected shape
+        text = _xml_itertext(r.content) if r.content.lstrip()[:1] == b"<" \
+            else _clean_text(r.text)
     return (text, url) if text else None
+
+
+def _elsevier_xml_to_text(xml_bytes: bytes) -> str:
+    """Extract readable prose from an Elsevier Article Retrieval XML response.
+    Keeps the article title, author abstract, and body section-titles+paragraphs
+    (math flattened inline so proofs survive); drops the coredata/objects metadata,
+    the asset list, the bibliography, and tables. Returns "" if it can't find an
+    article body (caller falls back)."""
+    from lxml import etree
+    try:
+        root = etree.fromstring(xml_bytes)
+    except etree.XMLSyntaxError:
+        return ""
+    ln = lambda e: etree.QName(e).localname
+    DROP = {"coredata", "objects", "bibliography", "ref-list", "references",
+            "ref", "table", "floats", "label"}
+    for el in list(root.iter()):
+        if ln(el) in DROP and el.getparent() is not None:
+            el.getparent().remove(el)
+    # collapse ALL whitespace (incl. the newlines MathML explodes into) so an
+    # equation reads inline: "∂t B − J ⋅ ∇ B = − B ⋅ ∇ J" not one symbol per line
+    g = lambda e: re.sub(r"\s+", " ", "".join(e.itertext())).strip()
+
+    arts = [e for e in root.iter() if ln(e) == "article"]
+    scope = arts[0] if arts else root
+    parts: list[str] = []
+    titles = [e for e in scope.iter() if ln(e) == "title" and len(g(e)) > 8]
+    if titles:
+        parts.append(g(titles[0]))
+    for ab in [e for e in scope.iter() if ln(e) == "abstract"][:1]:
+        txt = g(ab)
+        if txt:
+            parts.append("Abstract\n" + txt)
+    bodies = [e for e in scope.iter() if ln(e) in ("body", "sections")]
+    if not bodies:
+        return ""                         # no article body — let caller fall back
+    for el in bodies[0].iter():
+        if ln(el) == "section-title" and g(el):
+            parts.append("\n" + g(el))
+        elif ln(el) == "para" and g(el):
+            parts.append(g(el))
+    return _clean_text("\n\n".join(parts))
 
 
 def _xml_itertext(xml_bytes: bytes) -> str:
