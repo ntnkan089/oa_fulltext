@@ -138,6 +138,16 @@ soft per-paper budget that stops trying more sources once exceeded, so one hung
 server can't stall a worker. The `get()` helper honors `429`/`503` `Retry-After`
 so a fast run backs off instead of getting the polite-pool APIs to block it.
 
+**Embedding-ready clean corpus:** the fetcher retrieves; a separate step builds
+the consumer corpus. When a run is finished, run
+`python export_clean.py <run_dir>` to write `clean_corpus.jsonl` — one JSON line
+per *genuine* full-text paper (`{pub_id, doi, publisher, source, chars, text}`),
+with the garbage (`non_article` / `stub` / `refs_only` / bot-wall) filtered out —
+so a downstream embedding / RAG pipeline can ingest it directly. Tune freely
+without re-fetching: `--min-chars N`, `--include stub`. (Kept separate so a
+resumed 20k run isn't forced to re-read every `.txt` on each pass; pass `--export`
+to the fetcher if you do want it inline.)
+
 ## Output
 
 | file | what |
@@ -145,6 +155,8 @@ so a fast run backs off instead of getting the polite-pool APIs to block it.
 | `out/pub.<ID>.txt` | one plain-text file per retrieved paper |
 | `out/_manifest.csv` | one row per attempted DOI: status, source used, char count, `quality` grade, source URL |
 | `out/_manifest.jsonl` | append-only checkpoint (drives resume) |
+| `clean_corpus.jsonl` | (from `export_clean.py`) genuine full-text papers only, one JSON line each — embedding-ready |
+| `clean_index.csv` | (from `export_clean.py`) the manifest rows that made the clean cut, for review |
 
 `status` is one of: `ok`, `ok_thin` (got text but it's short scraped HTML —
 likely an abstract/repository stub, not full text), `oa_blocked` (an OA copy

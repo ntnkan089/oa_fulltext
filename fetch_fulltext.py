@@ -1010,11 +1010,55 @@ def write_manifest_csv(records: list[Result], path: Path) -> None:
             w.writerow(asdict(r))
 
 
+def export_clean_corpus(out_dir: Path, min_chars: int = 1500,
+                        include: set[str] | None = None) -> tuple[int, dict]:
+    """Write out_dir/clean_corpus.jsonl — only genuine full-text papers, ready
+    for a downstream embedding/RAG pipeline. Re-grades each .txt from disk (via
+    classify_quality) so garbage (non_article / stub / refs_only / bot-wall) is
+    dropped even in folders fetched before grading existed. Returns
+    (kept_count, dropped_reason_counts). Also writes clean_index.csv (kept rows,
+    no text) for review. Shared by --export and export_clean.py so they agree."""
+    keep = {"clean", *(include or set())}
+    manifest = out_dir / "_manifest.csv"
+    if not manifest.exists():
+        return 0, {}
+    rows = list(csv.DictReader(manifest.open(encoding="utf-8")))
+    kept: list[dict] = []
+    dropped: dict[str, int] = {}
+    with (out_dir / "clean_corpus.jsonl").open("w", encoding="utf-8") as corpus:
+        for r in rows:
+            if not r["status"].startswith("ok"):
+                continue
+            f = out_dir / f"{r['pub_id']}.txt"
+            if not f.exists():
+                continue
+            text = f.read_text(encoding="utf-8", errors="replace")
+            grade = "botwall" if _is_botwall(text) else classify_quality(text, r["source"])
+            if grade not in keep:
+                dropped[grade] = dropped.get(grade, 0) + 1
+                continue
+            if len(text) < min_chars:
+                dropped[f"short(<{min_chars})"] = dropped.get(f"short(<{min_chars})", 0) + 1
+                continue
+            corpus.write(json.dumps({
+                "pub_id": r["pub_id"], "doi": r["doi"], "publisher": r["publisher"],
+                "source": r["source"], "chars": len(text), "text": text,
+            }, ensure_ascii=False) + "\n")
+            kept.append(r)
+    if kept:
+        with (out_dir / "clean_index.csv").open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(kept[0].keys()))
+            w.writeheader()
+            w.writerows(kept)
+    return len(kept), dropped
+
+
 def run(input_path: Path, out_dir: Path, email: str, *,
         ids: list[str] | None, sample: int | None, limit: int | None,
         min_chars: int, delay: float, resume: bool, workers: int = 8,
         retry_misses: bool = False, recheck_misses: bool = False,
         miss_retries: int = 0, paper_timeout: float = 120.0,
+        export: bool = False, export_min_chars: int = 1500,
         elsevier_key: str | None = None, springer_key: str | None = None,
         wiley_token: str | None = None, use_browser: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,6 +1209,15 @@ def run(input_path: Path, out_dir: Path, email: str, *,
               "resume where it stopped. **")
     print(f"\nManifest: {manifest_csv}")
 
+    # Auto-export the embedding-ready clean corpus (only genuine full text —
+    # non_article/stub/refs_only/bot-wall dropped). Skip if interrupted, since
+    # the run is incomplete; re-run to finish, or run export_clean.py by hand.
+    if export and not interrupted:
+        kept, dropped = export_clean_corpus(out_dir, export_min_chars)
+        drop_str = ", ".join(f"{c} {k}" for k, c in sorted(dropped.items())) or "none"
+        print(f"Clean corpus: {kept} papers -> {out_dir / 'clean_corpus.jsonl'} "
+              f"(dropped: {drop_str})")
+
 
 def _read_all_records(manifest_jsonl: Path) -> list[Result]:
     """Read the append-only jsonl, keeping the LAST record per pub_id. Re-fetched
@@ -1300,6 +1353,14 @@ def main():
                          "rounds within the same run (stops early once a round "
                          "recovers nothing). Clears transient rate-limit/timeout "
                          "failures — folds the manual recheck loop into one run.")
+    ap.add_argument("--export", action="store_true",
+                    help="After the run, also write the embedding-ready "
+                         "clean_corpus.jsonl. Usually better to run export_clean.py "
+                         "separately when the fetch is finished (lets you tune the "
+                         "filters without re-fetching).")
+    ap.add_argument("--export-min-chars", type=int, default=1500,
+                    help="With --export: min chars for a paper to enter "
+                         "clean_corpus.jsonl (default 1500).")
     ap.add_argument("--paper-timeout", type=float, default=120.0,
                     help="Soft per-paper time budget in seconds (default 120). "
                          "Stops trying more sources once exceeded so one hung "
@@ -1344,6 +1405,7 @@ def main():
         workers=args.workers, retry_misses=args.retry_misses,
         recheck_misses=args.recheck_misses, miss_retries=args.miss_retries,
         paper_timeout=args.paper_timeout,
+        export=args.export, export_min_chars=args.export_min_chars,
         elsevier_key=elsevier_key, springer_key=springer_key,
         wiley_token=wiley_token, use_browser=args.use_browser)
 
