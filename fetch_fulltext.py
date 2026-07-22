@@ -862,6 +862,21 @@ def resolve_fulltext(session, doi: str, email: str, min_chars: int, *,
             if got:
                 consider((got[0], got[2]), got[1])
 
+    # 6.5. doi.org publisher-page fallback (plain HTTP, no browser). When
+    #      Unpaywall gave us no scrapable landing page but the publisher serves
+    #      full text as HTML from an entitled IP (e.g. academic.oup.com on the
+    #      UCI VPN), resolving the DOI directly recovers it. fetch_html_text
+    #      already rejects bot-wall pages and mines linked PDFs, so this safely
+    #      no-ops on the Cloudflare/JS misses (returns nothing). Skip if a PMC/
+    #      publisher-API copy already cleared the confident bar.
+    confident = any(len(t) >= CONFIDENT_CHARS for t, _, _ in candidates)
+    if not confident and not over_budget():
+        got = fetch_html_text(session, f"https://doi.org/{doi}")
+        if got:
+            saw_location = True
+            if consider((got, f"https://doi.org/{doi}"), "doi_landing"):
+                return best()
+
     # 7. Headless-browser fallback for Cloudflare/JS publisher pages, last
     #    because it's slow. Tries the publisher copy via doi.org.
     if browser is not None and not any(len(t) >= CONFIDENT_CHARS
