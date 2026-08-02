@@ -151,6 +151,15 @@ freely without re-fetching: `--min-chars N`, `--include stub`. (Kept separate so
 resumed 20k run isn't forced to re-read every `.txt` on each pass; pass `--export`
 to the fetcher if you do want it inline.)
 
+**Per-publisher Parquet (for the embedder):** the downstream consumer reads
+**Parquet** and wants the corpus grouped by publisher, so
+`python split_by_publisher.py <run_dir>` writes `<run_dir>/by_publisher/` — one
+`<publisher>.parquet` per publisher (9 publishers -> 9 files), same
+`{pub_id, doi, publisher, source, chars, text}` columns as the JSONL, plus a
+`_summary.csv` of paper counts. It (re)builds the clean corpus first, so it honors
+`--min-chars` / `--include` / `--raw` just like `export_clean.py` and you can run
+it directly without a separate export step.
+
 ## Output
 
 | file | what |
@@ -160,6 +169,7 @@ to the fetcher if you do want it inline.)
 | `out/_manifest.jsonl` | append-only checkpoint (drives resume) |
 | `clean_corpus.jsonl` | (from `export_clean.py`) genuine full-text papers only, one JSON line each — embedding-ready |
 | `clean_index.csv` | (from `export_clean.py`) the manifest rows that made the clean cut, for review |
+| `by_publisher/<publisher>.parquet` | (from `split_by_publisher.py`) the clean corpus split into one Parquet file per publisher |
 
 `status` is one of: `ok`, `ok_thin` (got text but it's short scraped HTML —
 likely an abstract/repository stub, not full text), `oa_blocked` (an OA copy
@@ -216,6 +226,8 @@ candidate: Elsevier ScienceDirect (biggest slice, cleanest keyed output).
 | file | what it does |
 | --- | --- |
 | `fetch_fulltext.py` | the whole tool: DOI resolver chain + downloader + manifest |
+| `export_clean.py` | build the embedding-ready `clean_corpus.jsonl` from a run |
+| `split_by_publisher.py` | split the clean corpus into one Parquet file per publisher |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | template for optional publisher API keys (copy to `.env`) |
 | `NOTES.md` | design notes, practicability findings, and next steps |
