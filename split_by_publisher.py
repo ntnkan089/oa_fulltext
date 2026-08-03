@@ -79,10 +79,20 @@ def main():
 
     cols = ["pub_id", "doi", "publisher", "source", "chars", "text"]
     summary = []
+    used: dict[str, str] = {}  # filename -> publisher, to catch slug collisions
     for publisher, recs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        df = pd.DataFrame(recs, columns=cols)
         fname = slug(publisher) + ".parquet"
-        df.to_parquet(out_dir / fname, engine="pyarrow", index=False)
+        # Two distinct publisher strings must never map to one file (silent
+        # overwrite = lost papers). Disambiguate with a numeric suffix.
+        if fname in used and used[fname] != publisher:
+            i, base_slug = 2, slug(publisher)
+            while f"{base_slug}_{i}.parquet" in used:
+                i += 1
+            fname = f"{base_slug}_{i}.parquet"
+        used[fname] = publisher
+        df = pd.DataFrame(recs, columns=cols)
+        df.to_parquet(out_dir / fname, engine="pyarrow", index=False,
+                      compression="zstd")
         summary.append({"publisher": publisher, "file": fname, "papers": len(recs)})
 
     pd.DataFrame(summary).to_csv(out_dir / "_summary.csv", index=False)
