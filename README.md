@@ -160,6 +160,14 @@ to the fetcher if you do want it inline.)
 `--min-chars` / `--include` / `--raw` just like `export_clean.py` and you can run
 it directly without a separate export step.
 
+Add `--prune-txt` to reclaim disk once the Parquet is built: it re-opens every
+Parquet, confirms each kept paper reads back non-empty, and only *then* deletes
+that paper's raw `pub.*.txt` (garbage `.txt` are left for audit; resume is
+unaffected — it's driven by `_manifest.jsonl`, not the `.txt`). It's build →
+verify → delete, never one-at-a-time, so a crash before the Parquet is complete
+deletes nothing. Destructive: once pruned you can't re-export those papers or
+change `--min-chars`/`--raw` for them.
+
 ## Output
 
 | file | what |

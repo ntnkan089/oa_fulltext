@@ -45,6 +45,14 @@ def main():
     ap.add_argument("--raw", action="store_true",
                     help="Skip the embedding scrub (keep reference lists, URLs, "
                          "Elsevier metadata in the exported text).")
+    ap.add_argument("--prune-txt", action="store_true",
+                    help="After the Parquet is written AND verified readable, "
+                         "delete the raw pub.*.txt files whose paper is now safely "
+                         "inside a Parquet, to reclaim disk. Resume is unaffected "
+                         "(it is driven by _manifest.jsonl, not the .txt files). "
+                         "Only the kept (clean) papers are deleted; garbage .txt "
+                         "stay for audit. Destructive — you cannot re-export those "
+                         "papers or change --min-chars/--raw for them afterward.")
     args = ap.parse_args()
 
     try:
@@ -101,6 +109,29 @@ def main():
     print(f"{args.run_dir}/by_publisher/: {total} papers -> {len(summary)} parquet files")
     for s in summary:
         print(f"  {s['file']:34} {s['papers']:>5}")
+
+    if args.prune_txt:
+        # VERIFY-then-DELETE: re-open every parquet we just wrote and collect the
+        # pub_ids that are provably inside one (non-empty text). Only those .txt
+        # get deleted, so a paper is never removed unless its content is safely
+        # readable back from a parquet. Garbage .txt (not in any parquet) stay.
+        safe: set[str] = set()
+        for s in summary:
+            back = pd.read_parquet(out_dir / s["file"], columns=["pub_id", "text"])
+            for pid, txt in zip(back["pub_id"], back["text"]):
+                if isinstance(txt, str) and txt:
+                    safe.add(pid)
+        if safe != {r["pub_id"] for recs in groups.values() for r in recs}:
+            sys.exit("prune aborted: parquet did not verify — no .txt deleted")
+        freed = deleted = 0
+        for pid in safe:
+            f = base / f"{pid}.txt"
+            if f.exists():
+                freed += f.stat().st_size
+                f.unlink()
+                deleted += 1
+        print(f"--prune-txt: deleted {deleted} raw .txt, freed {freed/1e6:.1f} MB "
+              f"(content preserved in Parquet)")
 
 
 if __name__ == "__main__":
