@@ -168,7 +168,9 @@ resume is
 unaffected — it's driven by `_manifest.jsonl`, not the `.txt`). It's build →
 verify → delete, never one-at-a-time, so a crash before the Parquet is complete
 deletes nothing. Destructive: once pruned you can't re-export those papers or
-change `--min-chars`/`--raw` for them.
+change `--min-chars`/`--raw` for them. Use `--prune-all-txt` to *also* delete the
+garbage `.txt` (stub / non_article / refs_only) that no Parquet keeps — same
+byte-for-byte safety on the clean papers first, but no audit trail is left.
 
 ## Output
 

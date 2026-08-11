@@ -53,7 +53,14 @@ def main():
                          "Only the kept (clean) papers are deleted; garbage .txt "
                          "stay for audit. Destructive — you cannot re-export those "
                          "papers or change --min-chars/--raw for them afterward.")
+    ap.add_argument("--prune-all-txt", action="store_true",
+                    help="Like --prune-txt, but ALSO delete the garbage pub.*.txt "
+                         "(stub / non_article / refs_only) that no Parquet keeps — "
+                         "no audit trail left. Still verifies the clean papers "
+                         "byte-for-byte first and deletes nothing if that fails.")
     args = ap.parse_args()
+    if args.prune_all_txt:
+        args.prune_txt = True
 
     try:
         import pandas as pd
@@ -136,6 +143,17 @@ def main():
                 deleted += 1
         print(f"--prune-txt: verified all {len(verified)} papers byte-for-byte; "
               f"deleted {deleted} raw .txt, freed {freed/1e6:.1f} MB")
+        if args.prune_all_txt:
+            # Only reached once the clean papers verified above — so this deletes
+            # the leftover garbage (stub / non_article / refs_only) that no Parquet
+            # kept. No audit trail remains after this.
+            g_freed = g_deleted = 0
+            for f in base.glob("pub.*.txt"):
+                g_freed += f.stat().st_size
+                f.unlink()
+                g_deleted += 1
+            print(f"--prune-all-txt: also deleted {g_deleted} garbage .txt, "
+                  f"freed {g_freed/1e6:.1f} MB (no audit trail left)")
 
 
 if __name__ == "__main__":
