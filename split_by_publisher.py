@@ -111,27 +111,31 @@ def main():
         print(f"  {s['file']:34} {s['papers']:>5}")
 
     if args.prune_txt:
-        # VERIFY-then-DELETE: re-open every parquet we just wrote and collect the
-        # pub_ids that are provably inside one (non-empty text). Only those .txt
-        # get deleted, so a paper is never removed unless its content is safely
-        # readable back from a parquet. Garbage .txt (not in any parquet) stay.
-        safe: set[str] = set()
+        # VERIFY-then-DELETE. Re-open every parquet we just wrote and compare each
+        # paper's text BYTE-FOR-BYTE against the exact text we put in it. A .txt is
+        # deleted only when its paper is provably identical inside a readable
+        # parquet; if a single paper fails to verify, abort and delete nothing.
+        # (~9 ms/paper — a few minutes even at 50k, negligible vs. the fetch.)
+        expected = {r["pub_id"]: r["text"] for recs in groups.values() for r in recs}
+        verified: set[str] = set()
         for s in summary:
             back = pd.read_parquet(out_dir / s["file"], columns=["pub_id", "text"])
             for pid, txt in zip(back["pub_id"], back["text"]):
-                if isinstance(txt, str) and txt:
-                    safe.add(pid)
-        if safe != {r["pub_id"] for recs in groups.values() for r in recs}:
-            sys.exit("prune aborted: parquet did not verify — no .txt deleted")
+                if isinstance(txt, str) and txt == expected.get(pid):
+                    verified.add(pid)
+        if verified != set(expected):
+            missing = len(set(expected) - verified)
+            sys.exit(f"prune aborted: {missing} paper(s) did not verify "
+                     f"byte-for-byte — no .txt deleted")
         freed = deleted = 0
-        for pid in safe:
+        for pid in verified:
             f = base / f"{pid}.txt"
             if f.exists():
                 freed += f.stat().st_size
                 f.unlink()
                 deleted += 1
-        print(f"--prune-txt: deleted {deleted} raw .txt, freed {freed/1e6:.1f} MB "
-              f"(content preserved in Parquet)")
+        print(f"--prune-txt: verified all {len(verified)} papers byte-for-byte; "
+              f"deleted {deleted} raw .txt, freed {freed/1e6:.1f} MB")
 
 
 if __name__ == "__main__":
