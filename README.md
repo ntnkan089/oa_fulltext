@@ -1,245 +1,112 @@
-# Open-Access Full-Text Downloader — prototype
+# Open-Access Full-Text Downloader
 
-Give it a list of DOIs (with Publication IDs); it writes the open-access full
-text of each paper to `out/pub.<ID>.txt`. Built to test the practicability of
-bulk-retrieving full text for the `oa_selected_pub` sample (20k papers, 9
-publishers, 4 OA types).
+Give it a list of DOIs; it retrieves the open-access full text of each paper,
+keeps only the genuine full-text ones, and packs them into one **Parquet file
+per publisher** — ready for a downstream embedding / AI pipeline.
 
-## Answering the spec's questions
+Built for the `oa_selected_pub` sample (20,000 papers, 9 publishers, 4 OA types).
 
-**API or web scraping?** Both, layered. We don't scrape publisher sites
-directly first. Instead each DOI is run through provider-neutral **APIs** that
-already know where the free copy lives (Europe PMC, NCBI PMC, Unpaywall), and
-we only fall back to fetching/parsing the publisher landing page when those
-don't resolve. This is why one code path covers all 9 publishers.
-
-**One code or one-per-publisher?** **One code path**, not nine. The OA copy is
-located by DOI through the shared resolver chain below, so publisher-specific
-scraping is mostly unnecessary. The exceptions are publishers that hide their
-OA full text behind JavaScript or a Cloudflare bot-wall (Elsevier, and
-sometimes MDPI/SAGE) — those need a publisher API key or a headless browser,
-added as *one more resolver*, not a separate program. The `Publisher` column
-is recorded but not currently required as input.
-
-## How a DOI is resolved
-
-Sources are tried best-text-quality-first, and we keep the **longest** result
-("best of locations") so a repository abstract never wins over a real
-full-text copy that also exists. We stop early the moment a source clears a
-confident-full-text bar (`CONFIDENT_CHARS`, 6000); otherwise every source is
-tried and the longest result ≥ `--min-chars` (default 1000) wins.
-
-0. **Publisher APIs (optional, need a key)** — Elsevier Article Retrieval,
-   Springer Nature OA, and Wiley TDM, used only for those publishers' DOIs.
-   Cleanest output, the fix for ScienceDirect's JS wall, and (Wiley) entitled
-   PDFs by DOI past the publisher wall.
-1. **Europe PMC JATS XML** — papers in EPMC's open-access subset.
-2. **NCBI PMC** — if a PMCID is known (from EPMC, an Unpaywall PMC link, or a
-   last-resort title search): `efetch` JATS XML, then the PMC HTML page.
-   Recovers most "green" OA copies.
-3. **Unpaywall PDFs** — every OA location's PDF, extracted with PyMuPDF. If a
-   browser UA gets HTML instead of a PDF (some repositories serve bots only),
-   we retry with a bare UA.
-4. **Landing pages** — the article body via trafilatura, AND any PDF the page
-   advertises (`citation_pdf_url`, `rel=alternate`, DSpace `/bitstream` links)
-   — this rescues repository deposits that show only an abstract as HTML.
-5. **Headless browser (optional, `--use-browser`)** — Playwright renders
-   Cloudflare/JS publisher pages (MDPI/SAGE/Elsevier) as a last resort.
-
-## Install
-
-Needs Python 3.10+.
+## Quick start
 
 ```bash
 git clone https://github.com/ntnkan089/oa_fulltext.git
 cd oa_fulltext
 python -m venv .venv
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-# macOS / Linux:
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1        # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
 ```
 
-Optional publisher keys go in a `.env` file (copy `.env.example` to `.env` and
-paste your keys) so you don't pass them on every run — they're loaded
-automatically. `.env` is git-ignored, so your keys never get committed.
+Optional publisher keys (free — Elsevier, Springer, Wiley) go in a `.env` file
+(copy `.env.example` to `.env`). They're loaded automatically and `.env` is
+git-ignored. The pipeline runs without them; a key just recovers more papers for
+that publisher.
 
-## Run
+## Run it (two commands)
 
-```
-# practicability test: ~2 papers PER publisher, spread across OA types
-python fetch_fulltext.py --sample 2
+```bash
+# 1. fetch the full text
+python fetch_fulltext.py --sample 50 --workers 12 --miss-retries 2 --paper-timeout 90
 
-# specific publication ids
-python fetch_fulltext.py --ids pub.1192432907 pub.1191002603
-
-# a real batch from the sheet (first N rows), 12 papers at a time
-python fetch_fulltext.py --limit 100 --workers 12
-
-# custom DOI list (any CSV with 'Publication ID' + 'DOI' columns)
-python fetch_fulltext.py --input my_dois.csv
-
-# with publisher keys (cleaner text + recovers ScienceDirect)
-python fetch_fulltext.py --sample 30 --elsevier-key XXX --springer-key YYY
-#   (or set $ELSEVIER_API_KEY / $SPRINGER_API_KEY)
-
-# add the headless-browser fallback for the Cloudflare/JS tail
-pip install playwright && python -m playwright install chromium
-python fetch_fulltext.py --sample 30 --use-browser
+# 2. build the clean per-publisher Parquet, then delete the raw text files
+python split_by_publisher.py out --prune-all-txt
 ```
 
-Keys: Elsevier (free, https://dev.elsevier.com), Springer Nature (free,
-https://dev.springernature.com). Both are optional — the pipeline runs key-free
-and only uses a key for that publisher's DOIs.
+That's it. `out/by_publisher/` now holds one `<publisher>.parquet` per publisher
+(9 publishers → 9 files) and nothing else — each row a genuine full-text paper:
+`{pub_id, doi, publisher, source, chars, text}`. (`--prune-all-txt` verifies every
+paper is safely inside its Parquet, byte-for-byte, before deleting anything.)
 
-**Concurrency.** `--workers N` (default 8) fetches N papers at once — the main
-lever for a full-scale run (270 papers ≈ 25 min serial → a few minutes at
-`--workers 12`; the 20k corpus goes from ~30 h to a few hours). Each paper writes
-its own file + manifest line, so parallel workers never collide, and resume works
-unchanged. `--use-browser` forces `--workers 1` (Playwright is single-threaded).
+**Choosing what to fetch:**
 
-**Bot-wall guard.** Some repositories/publishers (EconStor's Anubis, Cloudflare
-"Just a moment") serve a ~1 KB "prove you're human" page that would otherwise
-clear `--min-chars` and be saved as if it were the paper. Those are detected and
-recorded as `oa_blocked`, not counted as hits.
+| flag | meaning |
+|------|---------|
+| `--sample 50` | ~50 papers **per publisher**, spread across OA types (balanced test) |
+| `--limit 350` | the first 350 rows of the sheet as-is |
+| `--ids pub.123 pub.456` | specific publication IDs |
+| `--input my.csv` | your own CSV (needs `Publication ID` + `DOI` columns) |
+| `--out FOLDER` | where to write (default `out`) |
 
-**Quality grading (built in).** Every hit is auto-graded into a `quality` column
-in the manifest — `clean` (genuine full text), `non_article` (correction / erratum
-/ editorial — no body exists), `refs_only` (landing scrape that got abstract +
-bibliography but not the body), or `stub` (short abstract-only). The run summary
-prints both the raw retrieved count and the honest "genuine full text" count, so
-the hit rate isn't inflated by non-papers. `python audit_quality.py [out_dir ...]`
-is the same logic as a standalone re-check over existing folders.
+`--workers N` fetches N papers at once (12 is the sweet spot). Re-running
+**resumes** automatically; `--restart` starts fresh.
 
-Re-running **resumes** automatically (skips Publication IDs already fetched OK,
-per `out/_manifest.jsonl`); pass `--restart` to start fresh. `--input` defaults
-to the `oa_selected_pub - Sheet1.csv` in Downloads.
+**Want to keep the raw text too?** Use a gentler step 2:
 
-**Built for scale (20k):** resume also **caches misses** — papers already
-recorded `oa_blocked` / `not_indexed` are skipped on restart (pass
-`--retry-misses` to re-attempt), so a big run doesn't re-hit thousands of dead
-DOIs, each costing several 45 s timeouts.
+```bash
+python split_by_publisher.py out                 # keep every .txt, just add the Parquet
+python split_by_publisher.py out --prune-txt     # delete only the clean .txt, keep the few "garbage" ones for review
+```
 
-**Clearing transient misses in one run:** `--miss-retries N` auto-retries the
-misses up to N rounds after the main pass (stops early once a round recovers
-nothing). Many first-pass misses are transient — a worker hit a rate-limit or
-timed out under load — and a retry over the smaller miss set clears them, so you
-don't have to run `--recheck-misses` by hand afterward. (Distinct from the
-below, which is about papers that genuinely aren't available yet.)
+## How it works
 
-**Recovering the tail over time:** many misses are just *"not in PMC yet"* —
-MDPI/SAGE/Frontiers deposit to PMC on a lag. Run `--recheck-misses` weeks later
-to re-attempt only the recorded misses (ignores `--sample`/`--limit`) and report
-how many PMC has since indexed. It's also the way to sweep up the tail after
-turning on the VPN or adding a key. The manifest CSV is deduped newest-wins, so
-recovered papers cleanly replace their old miss row. `--paper-timeout N` (default 120 s) is a
-soft per-paper budget that stops trying more sources once exceeded, so one hung
-server can't stall a worker. The `get()` helper honors `429`/`503` `Retry-After`
-so a fast run backs off instead of getting the polite-pool APIs to block it.
+**One code path for all 9 publishers**, not nine scrapers. Each DOI is resolved
+through provider-neutral sources, best-quality-first, keeping the longest result:
 
-**Embedding-ready clean corpus:** the fetcher retrieves; a separate step builds
-the consumer corpus. When a run is finished, run
-`python export_clean.py <run_dir>` to write `clean_corpus.jsonl` — one JSON line
-per *genuine* full-text paper (`{pub_id, doi, publisher, source, chars, text}`),
-with the garbage (`non_article` / `stub` / `refs_only` / bot-wall) filtered out.
-Each kept paper is also **scrubbed for embedding**: the trailing reference list,
-bare URLs (Elsevier XML embeds a figure/equation object URL per formula — hundreds
-per math paper), and Elsevier metadata tokens are removed, so all sources come out
-uniform like the clean PMC XML. Pass `--raw` to keep the unscrubbed text. Tune
-freely without re-fetching: `--min-chars N`, `--include stub`. (Kept separate so a
-resumed 20k run isn't forced to re-read every `.txt` on each pass; pass `--export`
-to the fetcher if you do want it inline.)
+1. **Publisher APIs** (Elsevier / Springer / Wiley, if a key is set) — cleanest text.
+2. **Europe PMC / NCBI PMC** — JATS XML full text (clean sections + paragraphs).
+3. **Unpaywall PDFs** — extracted with PyMuPDF.
+4. **Landing pages** — article body + any PDF the page advertises.
+5. **`doi.org` fallback** and optional **headless browser** (`--use-browser`).
 
-**Per-publisher Parquet (for the embedder):** the downstream consumer reads
-**Parquet** and wants the corpus grouped by publisher, so
-`python split_by_publisher.py <run_dir>` writes `<run_dir>/by_publisher/` — one
-`<publisher>.parquet` per publisher (9 publishers -> 9 files), same
-`{pub_id, doi, publisher, source, chars, text}` columns as the JSONL, plus a
-`_summary.csv` of paper counts. It (re)builds the clean corpus first, so it honors
-`--min-chars` / `--include` / `--raw` just like `export_clean.py` and you can run
-it directly without a separate export step.
+**Every hit is auto-graded** so garbage never reaches your corpus:
 
-Add `--prune-txt` to reclaim disk once the Parquet is built: it re-opens every
-Parquet, confirms each kept paper reads back **byte-for-byte identical** to what
-was written (one mismatch aborts the whole prune, deleting nothing), and only
-*then* deletes that paper's raw `pub.*.txt` (garbage `.txt` are left for audit;
-resume is
-unaffected — it's driven by `_manifest.jsonl`, not the `.txt`). It's build →
-verify → delete, never one-at-a-time, so a crash before the Parquet is complete
-deletes nothing. Destructive: once pruned you can't re-export those papers or
-change `--min-chars`/`--raw` for them. Use `--prune-all-txt` to *also* delete the
-garbage `.txt` (stub / non_article / refs_only) that no Parquet keeps — same
-byte-for-byte safety on the clean papers first, but no audit trail is left.
+- `clean` — genuine full-text body (kept)
+- `non_article` — correction / erratum / editorial (no body exists)
+- `refs_only` — got the abstract + bibliography but not the body
+- `stub` — short abstract-only
+- bot-wall pages (Cloudflare "just a moment") are detected and rejected
+
+`split_by_publisher.py` keeps only `clean` and drops the rest. Each kept paper is
+also scrubbed for embedding (trailing reference list, stray URLs, and Elsevier
+metadata removed). Pass `--raw` to skip the scrub, `--min-chars N` to change the
+length floor, `--include stub` to also keep a grade you trust.
 
 ## Output
 
 | file | what |
 |------|------|
-| `out/pub.<ID>.txt` | one plain-text file per retrieved paper |
-| `out/_manifest.csv` | one row per attempted DOI: status, source used, char count, `quality` grade, source URL |
+| `out/pub.<ID>.txt` | one plain-text file per retrieved paper (working format) |
+| `out/_manifest.csv` | one row per DOI: status, source, char count, `quality` grade |
 | `out/_manifest.jsonl` | append-only checkpoint (drives resume) |
-| `clean_corpus.jsonl` | (from `export_clean.py`) genuine full-text papers only, one JSON line each — embedding-ready |
-| `clean_index.csv` | (from `export_clean.py`) the manifest rows that made the clean cut, for review |
-| `by_publisher/<publisher>.parquet` | (from `split_by_publisher.py`) the clean corpus split into one Parquet file per publisher |
+| `out/by_publisher/<publisher>.parquet` | **the deliverable** — clean full text, one file per publisher |
+| `out/by_publisher/_summary.csv` | paper counts per publisher |
 
-`status` is one of: `ok`, `ok_thin` (got text but it's short scraped HTML —
-likely an abstract/repository stub, not full text), `oa_blocked` (an OA copy
-exists but the publisher blocked the download / it parsed too short),
-`not_indexed` (no free copy known — likely truly closed / a non-article DOI),
-`error`.
+## Result (270-paper test, 30 per publisher)
 
-## Practicability result (270-paper sample, 30 per publisher)
-
-**Recommended config — Elsevier + Springer keys, browser OFF: 209/270 (77%)**
-in ~25 min. The Elsevier key is the big lever (Elsevier 4→27/30); Frontiers
-30/30, Springer 27/30. The headless-browser fallback was tested and does NOT
-beat the Cloudflare/Akamai walls (MDPI `Access Denied`, SAGE stuck on the
-challenge), so leave it off for bulk runs — it costs hours and recovers almost
-nothing. The remaining ~60 misses are Cloudflare/no-PMC publisher pages plus a
-few non-article DOIs.
-
-Key-free baseline (no keys): **187/270 (69%) — 182 real full text + 5 thin.** XML
-for most (NCBI PMC), PDF/HTML for the rest. Per publisher (full text):
-Frontiers 29, CUP 28, Springer 27, SAGE 24, Wiley 21, OUP 17, MDPI 16, T&F 16,
-**Elsevier 4**. By OA type: Gold 79%, Green 62%, Hybrid 60%, Bronze 46%.
-
-The key-free pipeline is now maxed out: the repository-PDF scraping, bot-UA
-retry, and best-of-locations logic mostly converted thin abstracts into real
-full text rather than raising the raw count. The remaining 83 misses are
-structurally gated, not pipeline gaps:
-
-- **Elsevier (26)** — ScienceDirect JS wall, no green copy → **`--elsevier-key`**.
-- **MDPI/OUP/T&F/Wiley/SAGE (53)** — Cloudflare/JS publisher pages with no PMC
-  or repository mirror → **`--use-browser`** (Playwright) or that publisher API.
-- **CUP/Frontiers/Springer (4)** — non-article DOIs / genuinely closed.
-
-So the two levers that actually raise the number from here are the Elsevier key
-and the browser fallback (both implemented). The misses below are `oa_blocked`:
-
-- **Elsevier** — ScienceDirect serves a JavaScript shell to scrapers and these
-  papers had no PMC mirror. Elsevier is ~26% of the full sample, so this is the
-  one slice worth an **API key** (free [ScienceDirect/TDM API](https://dev.elsevier.com));
-  add it as resolver #0 in `resolve_fulltext()`.
-- A few publisher landing pages (some MDPI/SAGE/T&F) sit behind Cloudflare and
-  401/403 plain HTTP. When they have a PMC copy we already get them; when they
-  don't, a headless browser (Playwright) would be the fallback.
-
-See `NOTES.md` for details and next steps.
-
-## Adding a publisher API later
-
-Drop one more attempt into `resolve_fulltext()` following the existing
-`(text, source_label, url, reason)` contract — nothing else changes. Good first
-candidate: Elsevier ScienceDirect (biggest slice, cleanest keyed output).
+**With Elsevier + Springer keys: 209/270 (77%)** genuine full text in ~25 min.
+Key-free baseline: **187/270 (69%)**. On the UCI VPN (institutional IP) it rises
+to ~77% as entitlement-gated papers (Oxford UP, etc.) unlock. The remaining tail
+is Cloudflare-walled publisher pages with no PMC mirror and a few non-article
+DOIs — structurally gated, not a pipeline gap. Projected on the full 20k: ~77%
+with the Elsevier key. See `NOTES.md` for the full breakdown.
 
 ## Files
 
 | file | what it does |
-| --- | --- |
-| `fetch_fulltext.py` | the whole tool: DOI resolver chain + downloader + manifest |
-| `export_clean.py` | build the embedding-ready `clean_corpus.jsonl` from a run |
-| `split_by_publisher.py` | split the clean corpus into one Parquet file per publisher |
+|------|--------------|
+| `fetch_fulltext.py` | the scraper: DOI resolver chain + downloader + manifest + grading |
+| `split_by_publisher.py` | clean corpus → one Parquet per publisher (the deliverable) |
+| `export_clean.py` | build just the `clean_corpus.jsonl` (single-file variant) |
+| `audit_quality.py` | re-run the quality grading over an existing folder |
 | `requirements.txt` | Python dependencies |
-| `.env.example` | template for optional publisher API keys (copy to `.env`) |
-| `NOTES.md` | design notes, practicability findings, and next steps |
+| `.env.example` | template for optional publisher API keys |
+| `NOTES.md` | design notes, practicability findings, next steps |
