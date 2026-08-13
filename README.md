@@ -1,8 +1,8 @@
 # Open-Access Full-Text Downloader
 
 Give it a list of DOIs; it retrieves the open-access full text of each paper,
-keeps only the genuine full-text ones, and packs them into one **Parquet file
-per publisher** — ready for a downstream embedding / AI pipeline.
+keeps only the genuine full-text ones, and writes each as its own **Parquet file
+inside a publisher-named folder** — ready for a downstream embedding / AI pipeline.
 
 Built for the `oa_selected_pub` sample (20,000 papers, 9 publishers, 4 OA types).
 
@@ -31,8 +31,19 @@ python fetch_fulltext.py --sample 50 --workers 12 --miss-retries 2 --paper-timeo
 python split_by_publisher.py out --prune-all-txt
 ```
 
-That's it. `out/by_publisher/` now holds one `<publisher>.parquet` per publisher
-(9 publishers → 9 files) and nothing else — each row a genuine full-text paper:
+That's it. `out/by_publisher/` now holds one folder per publisher, and inside each
+folder one Parquet file per paper:
+
+```
+out/by_publisher/
+    Elsevier/pub.123.parquet
+    Elsevier/pub.456.parquet
+    Springer Nature/pub.789.parquet
+    ...
+    _summary.csv
+```
+
+Each `pub.<id>.parquet` is a single genuine full-text paper:
 `{pub_id, doi, publisher, source, chars, text}`. (`--prune-all-txt` verifies every
 paper is safely inside its Parquet, byte-for-byte, before deleting anything.)
 
@@ -87,7 +98,7 @@ length floor, `--include stub` to also keep a grade you trust.
 | `out/pub.<ID>.txt` | one plain-text file per retrieved paper (working format) |
 | `out/_manifest.csv` | one row per DOI: status, source, char count, `quality` grade |
 | `out/_manifest.jsonl` | append-only checkpoint (drives resume) |
-| `out/by_publisher/<publisher>.parquet` | **the deliverable** — clean full text, one file per publisher |
+| `out/by_publisher/<Publisher>/pub.<ID>.parquet` | **the deliverable** — one clean full-text paper per file, filed under its publisher |
 | `out/by_publisher/_summary.csv` | paper counts per publisher |
 
 ## Result (270-paper test, 30 per publisher)
@@ -104,7 +115,7 @@ with the Elsevier key. See `NOTES.md` for the full breakdown.
 | file | what it does |
 |------|--------------|
 | `fetch_fulltext.py` | the scraper: DOI resolver chain + downloader + manifest + grading |
-| `split_by_publisher.py` | clean corpus → one Parquet per publisher (the deliverable) |
+| `split_by_publisher.py` | clean corpus → one Parquet per paper, filed under its publisher (the deliverable) |
 | `export_clean.py` | build just the `clean_corpus.jsonl` (single-file variant) |
 | `audit_quality.py` | re-run the quality grading over an existing folder |
 | `requirements.txt` | Python dependencies |
